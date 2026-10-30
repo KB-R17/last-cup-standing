@@ -1,0 +1,7 @@
+{
+  "name": "last-cup-standing",
+  "version": "1.0.0",
+  "description": "Last Cup Standing — Caffeinated Army last-one-standing stream game (Fossabot + Vercel + Upstash)",
+  "private": true,
+  "engines": { "node": "24.x" }
+}

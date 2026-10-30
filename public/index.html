@@ -1,0 +1,683 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Last Cup Standing</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+<style>
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+  body.bg { background: #07010f; }
+  canvas { display: block; position: absolute; inset: 0; margin: auto; width: 100vw; height: 56.25vw; max-height: 100vh; max-width: 177.78vh; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+/* ============================================================
+   LAST CUP STANDING — Caffeinated Army bump battle
+   Everyone starts with the same shields. Every bump costs a shield
+   (with a short cooldown so a rebound can't double-hit). No shields
+   left → the next bump spills you. Last cup standing wins.
+   OBS browser source 1920x1080.
+   URL params:
+     key=ADMIN_KEY   (required for live mode; without it the game runs in DEMO mode with bots)
+     api=URL         (defaults to this page's origin)
+     shields=5       (starting shields; otherwise uses START_SHIELDS from the server, default 5)
+     hitcd=0.8       (seconds of shield cooldown after taking a bump)
+     auto=0          (disable auto-cycling lobby → round → winner)
+     lobby=60  cooldown=12  min=2   bg=1 (opaque)  sound=0  demo=1
+     art=URL         (background image; default: tries bg.jpg / bg.png / bg.webp next to this page)
+     artop=0.5       (background opacity 0–1)   artblur=0 (blur px)   art=none (turn it off)
+     floor=0.7       (cup floor opacity; 0.7 with art, 0.88 without — lower shows more art)
+   Hotkeys (OBS: right-click source → Interact):
+     O open lobby · S start now · R reset · B add 5 bots · K spill a random player · M mute
+   ============================================================ */
+const Q = new URLSearchParams(location.search);
+const httpOrigin = /^https?:$/.test(location.protocol) ? location.origin : '';
+const CFG = {
+  api: (Q.get('api') || httpOrigin).replace(/\/$/, ''),
+  key: Q.get('key') || '',
+  shields: Q.get('shields') ? Math.max(0, +Q.get('shields')) : 5,
+  shieldsFromUrl: !!Q.get('shields'),
+  hitcd: +(Q.get('hitcd') || 1.0),
+  auto: Q.get('auto') !== '0',
+  lobby: +(Q.get('lobby') || 60),
+  cooldown: +(Q.get('cooldown') || 12),
+  min: Math.max(2, +(Q.get('min') || 2)),
+  sound: Q.get('sound') !== '0',
+  art: Q.get('art') || '',
+  artop: clamp01(Q.get('artop'), 0.5),
+  artblur: Math.max(0, +(Q.get('artblur') || 0)),
+  floor: clamp01(Q.get('floor'), 0.88),
+  floorSet: Q.has('floor'),
+};
+function clamp01(v, d) { const n = v === null || v === '' ? d : +v; return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : d; }
+CFG.demo = Q.get('demo') === '1' || !CFG.key || !CFG.api;
+if (Q.get('bg') === '1') document.body.classList.add('bg');
+
+const C = { orange: '#ff8c1a', cyan: '#00e5ff', pink: '#ff2bd6', purple: '#7b2cff', deep: '#0d0221', white: '#f4f0ff' };
+const PLATFORM_RIM = { youtube: '#ff3355', twitch: '#9146ff', kick: '#53fc18' };
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const W = 1920, H = 1080, CX = 960, CY = 600, AR = 420;
+
+const BASE_SPEED = 105;     // px/s at round start
+const MAX_MULT = 2.6;       // speed ramps up to this over the round
+const RAMP_SECS = 60;       // +100% speed every 60s
+const MAGNET_AT = 75;       // after this many seconds cups drift toward the nearest rival
+
+const rand = Math.random;
+const rnd = (a, b) => a + rand() * (b - a);
+const pick = (a) => a[(rand() * a.length) | 0];
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const dist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
+
+// ---------- state ----------
+let phase = 'boot';            // boot | idle | open | starting | live | winner
+let T = 0;
+let players = new Map();
+let alive = [];
+let total = 0;
+let parts = [], floats = [], feed = [];
+let fame = [];
+let round = 0, lobbyEnd = 0, needMsg = '';
+let liveT = 0, speedMult = 1;
+let winner = null, winT = 0, cooldownEnd = 0;
+let netOk = true, demoJoinTimer = 0, botN = 0;
+
+// ---------- sound ----------
+let AC = null, lastHitSnd = 0;
+function tone(f, d, type = 'square', vol = 0.04, slide = 0, delay = 0) {
+  if (!CFG.sound) return;
+  try {
+    AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+    const t0 = AC.currentTime + delay;
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f, t0);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, f + slide), t0 + d);
+    g.gain.setValueAtTime(vol, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + d);
+    o.connect(g).connect(AC.destination);
+    o.start(t0); o.stop(t0 + d + 0.02);
+  } catch (e) {}
+}
+const sfx = {
+  join: () => { tone(660, 0.08, 'triangle', 0.05); tone(990, 0.1, 'triangle', 0.05, 0, 0.07); },
+  bump: () => { const n = performance.now(); if (n - lastHitSnd < 60) return; lastHitSnd = n; tone(1400, 0.12, 'triangle', 0.035, -700); },
+  boop: () => tone(240, 0.06, 'sine', 0.025, -60),
+  spill: () => tone(320, 0.35, 'sawtooth', 0.05, -260),
+  bell: () => { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.18, 'square', 0.04, 0, i * 0.09)); },
+  win: () => { [523, 659, 784, 1047, 784, 1047, 1319].forEach((f, i) => tone(f, 0.22, 'square', 0.045, 0, i * 0.12)); },
+  tick: () => tone(880, 0.05, 'square', 0.03),
+};
+
+// ---------- network ----------
+async function api(path, params = {}) {
+  const u = new URL(CFG.api + path);
+  for (const k in params) u.searchParams.set(k, params[k]);
+  u.searchParams.set('key', CFG.key);
+  const r = await fetch(u, { cache: 'no-store' });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+async function poll() {
+  if (CFG.demo) return;
+  try {
+    const s = await api('/api/state');
+    netOk = true;
+    fame = s.top || [];
+    if (!CFG.shieldsFromUrl && Number.isFinite(s.shields)) CFG.shields = s.shields;
+    if (phase === 'open' && s.state && s.state.round === round) {
+      for (const pl of s.roster || []) if (!players.has(pl.login)) addPlayer(pl, true);
+    }
+  } catch (e) { netOk = false; }
+  setTimeout(poll, 1500);
+}
+
+// ---------- sprites ----------
+function hashHue(s) { let h = 0; for (const ch of s) h = (h * 31 + ch.charCodeAt(0)) | 0; return Math.abs(h); }
+function makeSprite(p) {
+  const S = 128, c = document.createElement('canvas');
+  c.width = c.height = S;
+  const g = c.getContext('2d');
+  g.save();
+  g.beginPath(); g.arc(S / 2, S / 2, S / 2, 0, Math.PI * 2); g.clip();
+  if (p.img && p.imgOk) {
+    g.drawImage(p.img, 0, 0, S, S);
+  } else {
+    const pal = [[C.orange, C.pink], [C.cyan, C.purple], [C.pink, C.purple], [C.orange, C.purple], [C.cyan, C.pink]];
+    const [a, b] = pal[hashHue(p.login) % pal.length];
+    const gr = g.createLinearGradient(0, 0, S, S);
+    gr.addColorStop(0, a); gr.addColorStop(1, b);
+    g.fillStyle = gr; g.fillRect(0, 0, S, S);
+    g.fillStyle = 'rgba(13,2,33,.85)';
+    g.font = '900 52px Orbitron, sans-serif';
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillText((p.name || '?').replace(/[^a-z0-9]/gi, '').slice(0, 2).toUpperCase() || '☕', S / 2, S / 2 + 3);
+  }
+  g.restore();
+  p.sprite = c;
+}
+
+// ---------- players ----------
+function radiusFor(n) { return clamp(38 - n * 0.4, 18, 32); }
+
+function addPlayer(pl, fromChat) {
+  if (players.has(pl.login)) return players.get(pl.login);
+  const a = rand() * Math.PI * 2, d = Math.sqrt(rand()) * (AR - 60), h = rand() * Math.PI * 2;
+  const p = {
+    login: pl.login, name: pl.name || pl.login, platform: (pl.platform || '').toLowerCase(),
+    avatar: pl.avatar || '', shields: CFG.shields,
+    x: CX + Math.cos(a) * d, y: CY + Math.sin(a) * d,
+    vx: Math.cos(h) * BASE_SPEED * 0.5, vy: Math.sin(h) * BASE_SPEED * 0.5,
+    r: radiusFor(players.size + 1), alive: true, inv: 0, flash: 0, pop: 0,
+    wobble: rnd(0.3, 0.9), impact: 0, lastBy: null, bumps: 0, bot: !!pl.bot,
+  };
+  makeSprite(p);
+  if (p.avatar) {
+    p.img = new Image();
+    p.img.referrerPolicy = 'no-referrer';
+    p.img.onload = () => { p.imgOk = true; makeSprite(p); };
+    p.img.src = p.avatar;
+  }
+  players.set(p.login, p);
+  const rr = radiusFor(players.size);
+  players.forEach((q) => (q.r = rr));
+  if (fromChat !== false) {
+    sfx.join();
+    floats.push({ x: p.x, y: p.y - 40, text: 'JOINED', color: C.cyan, t: 0, life: 1.6 });
+  }
+  return p;
+}
+
+const BOT_NAMES = ['EspressoEdgar', 'LatteLord', 'ColdBrewCarl', 'MochaMarine', 'DecafDan', 'BeanCounter', 'CremaQueen', 'FrappeFrank',
+  'DoppioDelta', 'RistrettoRex', 'CortadoKai', 'AmericanoAce', 'MacchiatoMax', 'AffogatoAmy', 'SOCOM_Sam', 'MAG_Raven', 'HelghastHank',
+  'ChimeraChris', 'NineBall', 'ArmoredJoe', 'PS2Pilot', 'GrinderGus', 'FrenchPressFi', 'KCupKyle', 'DripDrew', 'BaristaBlu'];
+function addBot() {
+  const n = ++botN;
+  const name = BOT_NAMES[(n - 1) % BOT_NAMES.length] + (n > BOT_NAMES.length ? n : '');
+  addPlayer({ login: 'bot:' + name.toLowerCase(), name, platform: pick(['youtube', 'twitch', 'kick']), bot: true });
+}
+
+// ---------- round flow ----------
+function clearArena() {
+  players = new Map(); alive = []; feed = []; floats = []; winner = null; needMsg = ''; speedMult = 1;
+}
+
+async function openLobby() {
+  clearArena();
+  phase = 'open';
+  lobbyEnd = T + CFG.lobby;
+  demoJoinTimer = 1;
+  sfx.bell();
+  if (CFG.demo) { round++; return; }
+  try { const r = await api('/api/round', { action: 'open' }); round = r.state.round; netOk = true; }
+  catch (e) { netOk = false; }
+}
+
+async function startRound() {
+  if (phase !== 'open' || players.size < 2) return;
+  phase = 'starting';
+  if (!CFG.demo) {
+    try {
+      const r = await api('/api/round', { action: 'start' });
+      for (const pl of r.roster || []) addPlayer(pl, false);
+    } catch (e) { netOk = false; }
+  }
+  const list = [...players.values()];
+  const rr = radiusFor(list.length);
+  list.forEach((p) => { p.r = rr; p.alive = true; p.inv = 0; p.shields = CFG.shields; p.bumps = 0; p.lastBy = null; });
+  alive = list.slice();
+  total = list.length;
+  feed = [];
+  liveT = 0; speedMult = 1;
+  phase = 'live';
+  sfx.bell();
+}
+
+function endRound(w) {
+  phase = 'winner';
+  winner = w; winT = 0; w.wins = null;
+  cooldownEnd = T + CFG.cooldown;
+  sfx.win();
+  if (!CFG.demo && !w.bot) {
+    api('/api/round', { action: 'end', winner: w.login, name: w.name })
+      .then((r) => { w.wins = r.wins; })
+      .catch(() => {});
+  }
+}
+
+async function resetAll() {
+  clearArena();
+  phase = 'idle';
+  if (!CFG.demo) { try { await api('/api/round', { action: 'reset' }); } catch (e) {} }
+  if (CFG.auto) openLobby();
+}
+
+// ---------- damage ----------
+let pending = [];
+function bump(p, by, force) {
+  if (!p.alive || pending.includes(p)) return;
+  if (p.inv > 0 && !force) return;          // shield cooldown — rebounds don't double-hit
+  p.inv = CFG.hitcd; p.flash = 1; p.lastBy = by;
+  if (p.shields > 0) {
+    p.shields--;
+    burst(p.x, p.y, C.cyan, 12, 220);
+    floats.push({ x: p.x, y: p.y - p.r - 14, text: '-🛡', color: C.cyan, t: 0, life: 0.9 });
+    sfx.bump();
+  } else {
+    pending.push(p);
+  }
+}
+function processEliminations() {
+  if (!pending.length) return;
+  if (pending.length >= alive.length) {
+    // The final cups spilled each other on the same bump: the one who hit harder survives.
+    const saved = pending.reduce((a, b) => (b.impact > a.impact ? b : a));
+    pending = pending.filter((p) => p !== saved);
+    floats.push({ x: saved.x, y: saved.y - saved.r - 20, text: 'HIT HARDER!', color: C.orange, t: 0, life: 1.6 });
+  }
+  for (const p of pending) {
+    p.alive = false;
+    p.place = alive.length;
+    alive = alive.filter((q) => q !== p);
+    if (p.lastBy && p.lastBy.alive) p.lastBy.bumps++;
+    burst(p.x, p.y, C.orange, 26, 320);
+    burst(p.x, p.y, '#6b3a1e', 16, 200);
+    floats.push({ x: p.x, y: p.y, text: 'SPILLED', color: C.orange, t: 0, life: 1.2 });
+    feed.unshift({ name: p.name, by: p.lastBy ? p.lastBy.name : '', place: p.place, t: T });
+    if (feed.length > 7) feed.pop();
+  }
+  sfx.spill();
+  pending = [];
+  if (alive.length === 1 && phase === 'live') endRound(alive[0]);
+}
+
+// ---------- particles ----------
+function burst(x, y, color, n, sp) {
+  for (let i = 0; i < n && parts.length < 700; i++) {
+    const a = rand() * Math.PI * 2, s = rnd(0.25, 1) * sp;
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rnd(0.4, 0.9), t: 0, color, size: rnd(2, 5) });
+  }
+}
+function confetti() {
+  for (let i = 0; i < 4 && parts.length < 700; i++) {
+    parts.push({ x: rnd(300, 1620), y: -10, vx: rnd(-40, 40), vy: rnd(160, 300), life: 4, t: 0, color: pick([C.orange, C.cyan, C.pink, C.purple]), size: rnd(4, 8), g: 1 });
+  }
+}
+
+// ---------- physics ----------
+function nearestRival(p) {
+  let best = null, bd = Infinity;
+  for (const q of alive) { if (q === p) continue; const d = dist(p.x, p.y, q.x, q.y); if (d < bd) { bd = d; best = q; } }
+  return best;
+}
+
+function physics(dt) {
+  const live = phase === 'live' && liveT > 3;
+  const list = phase === 'live' || phase === 'starting' ? alive : [...players.values()];
+  const target = live ? BASE_SPEED * speedMult : phase === 'live' ? 0 : BASE_SPEED * 0.45;
+
+  for (const p of list) {
+    // gentle wander so paths don't loop forever
+    const turn = rnd(-1, 1) * p.wobble * dt * 1.6;
+    const c = Math.cos(turn), s = Math.sin(turn);
+    let vx = p.vx * c - p.vy * s, vy = p.vx * s + p.vy * c;
+    // late-round magnet toward the nearest rival so it can't stall
+    if (live && liveT - 3 > MAGNET_AT) {
+      const r = nearestRival(p);
+      if (r) {
+        const dx = r.x - p.x, dy = r.y - p.y, l = Math.hypot(dx, dy) || 1;
+        const pull = Math.min(0.6, (liveT - 3 - MAGNET_AT) / 60) * target;
+        vx += (dx / l) * pull * dt * 2; vy += (dy / l) * pull * dt * 2;
+      }
+    }
+    // ease speed back to the target (bumps can speed up / slow down a cup briefly)
+    if (Math.hypot(vx, vy) < 1 && target > 0) { const h = rand() * Math.PI * 2; vx = Math.cos(h) * 2; vy = Math.sin(h) * 2; }
+    const sp = Math.hypot(vx, vy) || 1;
+    const ns = sp + (target - sp) * Math.min(1, dt * 2.5);
+    p.vx = vx / sp * ns; p.vy = vy / sp * ns;
+    if (target === 0 && sp < 1) { p.vx = 0; p.vy = 0; }
+    p.x += p.vx * dt; p.y += p.vy * dt;
+
+    // bounce off the outer rim of the cup (no damage)
+    const d = dist(p.x, p.y, CX, CY), lim = AR - p.r - 4;
+    if (d > lim) {
+      const nx = (p.x - CX) / d, ny = (p.y - CY) / d;
+      p.x = CX + nx * lim; p.y = CY + ny * lim;
+      const vn = p.vx * nx + p.vy * ny;
+      if (vn > 0) { p.vx -= 2 * vn * nx; p.vy -= 2 * vn * ny; }
+    }
+  }
+
+  // cup-vs-cup collisions
+  for (let i = 0; i < list.length; i++) {
+    const a = list[i];
+    for (let j = i + 1; j < list.length; j++) {
+      const b = list[j];
+      const dx = b.x - a.x, dy = b.y - a.y, md = a.r + b.r;
+      if (Math.abs(dx) > md || Math.abs(dy) > md) continue;
+      const d2 = dx * dx + dy * dy;
+      if (d2 >= md * md || d2 === 0) continue;
+      const d = Math.sqrt(d2), nx = dx / d, ny = dy / d, ov = (md - d) / 2;
+      a.x -= nx * ov; a.y -= ny * ov; b.x += nx * ov; b.y += ny * ov;
+      const van = a.vx * nx + a.vy * ny, vbn = b.vx * nx + b.vy * ny;
+      const rv = vbn - van;
+      if (rv >= 0) continue;                 // already separating
+      // equal-mass elastic bounce: swap normal velocity components
+      a.vx += (vbn - van) * nx; a.vy += (vbn - van) * ny;
+      b.vx += (van - vbn) * nx; b.vy += (van - vbn) * ny;
+      if (phase === 'live' && liveT > 3) {
+        a.impact = Math.max(0, van);         // how hard each cup was driving into the other
+        b.impact = Math.max(0, -vbn);
+        bump(a, b); bump(b, a);
+      } else sfx.boop();
+    }
+  }
+}
+
+// ---------- update ----------
+function update(dt) {
+  for (const p of players.values()) {
+    p.pop = Math.min(1, p.pop + dt * 3);
+    if (p.inv > 0) p.inv -= dt;
+    if (p.flash > 0) p.flash -= dt * 4;
+  }
+
+  if (phase === 'open') {
+    if (CFG.demo) {
+      demoJoinTimer -= dt;
+      if (demoJoinTimer <= 0 && players.size < 22) { addBot(); demoJoinTimer = rnd(0.5, 1.8); }
+    }
+    const left = lobbyEnd - T;
+    if (left <= 3 && left > 0 && Math.ceil(left) !== Math.ceil(left + dt)) sfx.tick();
+    if (left <= 0) {
+      if (players.size >= CFG.min) { needMsg = ''; startRound(); }
+      else { needMsg = `NEED ${CFG.min - players.size} MORE TO START`; lobbyEnd = T + 20; }
+    }
+  }
+
+  if (phase === 'live') {
+    liveT += dt;
+    if (liveT > 3) speedMult = Math.min(MAX_MULT, 1 + (liveT - 3) / RAMP_SECS);
+  }
+
+  if (phase === 'live' || phase === 'open' || phase === 'starting') physics(dt);
+  if (phase === 'live') processEliminations();
+
+  if (phase === 'winner') {
+    winT += dt;
+    if (winT < 6) confetti();
+    if (T >= cooldownEnd) { if (CFG.auto) openLobby(); else { clearArena(); phase = 'idle'; } }
+  }
+
+  for (const q of parts) { q.t += dt; q.x += q.vx * dt; q.y += q.vy * dt; if (q.g) q.vx *= 0.99; else { q.vx *= 0.94; q.vy *= 0.94; } }
+  parts = parts.filter((q) => q.t < q.life);
+  for (const f of floats) { f.t += dt; f.y -= 34 * dt; }
+  floats = floats.filter((f) => f.t < f.life);
+}
+
+// ---------- static layers ----------
+let arenaLayer, titleLayer, artLayer = null;
+
+// Channel-art background: cover-fit to 1920x1080, faded + vignetted so the game stays readable.
+function loadArt() {
+  if (CFG.art === 'none') return;
+  const tries = CFG.art ? [CFG.art] : ['bg.jpg', 'bg.png', 'bg.webp'];
+  const next = () => {
+    const src = tries.shift();
+    if (!src) return;
+    const img = new Image();
+    img.onload = () => buildArt(img);
+    img.onerror = next;
+    img.src = src;
+  };
+  next();
+}
+function buildArt(img) {
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const g = c.getContext('2d');
+  const s = Math.max(W / img.width, H / img.height);
+  const w = img.width * s, h = img.height * s;
+  if (CFG.artblur) g.filter = `blur(${CFG.artblur}px)`;
+  g.globalAlpha = CFG.artop;
+  g.drawImage(img, (W - w) / 2, (H - h) / 2, w, h);
+  g.filter = 'none'; g.globalAlpha = 1;
+  // darken the edges and the strip behind the title so HUD text pops
+  const v = g.createRadialGradient(CX, CY, AR * 0.9, CX, CY, W * 0.62);
+  v.addColorStop(0, 'rgba(7,1,15,0)'); v.addColorStop(1, 'rgba(7,1,15,.55)');
+  g.fillStyle = v; g.fillRect(0, 0, W, H);
+  const t = g.createLinearGradient(0, 0, 0, 170);
+  t.addColorStop(0, 'rgba(7,1,15,.55)'); t.addColorStop(1, 'rgba(7,1,15,0)');
+  g.fillStyle = t; g.fillRect(0, 0, W, 170);
+  artLayer = c;
+  // with art behind it, thin the cup floor so the mascot shows through (unless floor= was set)
+  if (!CFG.floorSet) { CFG.floor = 0.7; buildLayers(); }
+}
+
+function buildLayers() {
+  arenaLayer = document.createElement('canvas');
+  arenaLayer.width = W; arenaLayer.height = H;
+  const g = arenaLayer.getContext('2d');
+  const gr = g.createRadialGradient(CX, CY, 40, CX, CY, AR);
+  const fl = CFG.floor;
+  gr.addColorStop(0, `rgba(40,10,70,${fl})`); gr.addColorStop(1, `rgba(13,2,33,${Math.min(1, fl + 0.04)})`);
+  g.fillStyle = gr; g.beginPath(); g.arc(CX, CY, AR, 0, Math.PI * 2); g.fill();
+  g.save(); g.beginPath(); g.arc(CX, CY, AR, 0, Math.PI * 2); g.clip();
+  g.strokeStyle = 'rgba(123,44,255,.28)'; g.lineWidth = 1.5;
+  for (let r = 60; r < AR; r += 60) { g.beginPath(); g.arc(CX, CY, r, 0, Math.PI * 2); g.stroke(); }
+  for (let i = 0; i < 24; i++) { const a = (i / 24) * Math.PI * 2; g.beginPath(); g.moveTo(CX, CY); g.lineTo(CX + Math.cos(a) * AR, CY + Math.sin(a) * AR); g.stroke(); }
+  g.strokeStyle = 'rgba(255,140,26,.10)'; g.lineWidth = 10;
+  g.beginPath(); for (let t = 0; t < 6 * Math.PI; t += 0.05) { const r = 8 + t * 7; g.lineTo(CX + Math.cos(t) * r, CY + Math.sin(t) * r); } g.stroke();
+  g.restore();
+  g.shadowBlur = 24; g.shadowColor = C.pink; g.strokeStyle = C.pink; g.lineWidth = 5;
+  g.beginPath(); g.arc(CX, CY, AR, 0, Math.PI * 2); g.stroke();
+  g.shadowColor = C.cyan; g.strokeStyle = C.cyan; g.lineWidth = 2;
+  g.beginPath(); g.arc(CX, CY, AR + 10, 0, Math.PI * 2); g.stroke();
+  g.shadowColor = C.orange; g.strokeStyle = C.orange; g.lineWidth = 6;
+  g.beginPath(); g.arc(CX + AR + 40, CY, 70, -Math.PI / 2.4, Math.PI / 2.4); g.stroke();
+
+  titleLayer = document.createElement('canvas');
+  titleLayer.width = 1100; titleLayer.height = 110;
+  const t = titleLayer.getContext('2d');
+  t.font = '900 62px Orbitron, sans-serif'; t.textAlign = 'center'; t.textBaseline = 'middle';
+  const tg = t.createLinearGradient(200, 0, 900, 0);
+  tg.addColorStop(0, C.orange); tg.addColorStop(0.5, C.pink); tg.addColorStop(1, C.cyan);
+  t.shadowBlur = 22; t.shadowColor = C.pink; t.fillStyle = tg;
+  t.fillText('LAST CUP STANDING', 550, 56);
+  t.shadowBlur = 0; t.fillText('LAST CUP STANDING', 550, 56);
+}
+
+// ---------- drawing ----------
+function panel(x, y, w, h, color = C.cyan) {
+  ctx.fillStyle = 'rgba(13,2,33,.78)';
+  ctx.strokeStyle = color; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.roundRect ? ctx.roundRect(x, y, w, h, 12) : ctx.rect(x, y, w, h);
+  ctx.fill(); ctx.stroke();
+}
+function label(text, x, y, font, color, align = 'center') {
+  ctx.font = font; ctx.textAlign = align; ctx.textBaseline = 'middle';
+  ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(7,1,15,.9)'; ctx.strokeText(text, x, y);
+  ctx.fillStyle = color; ctx.fillText(text, x, y);
+}
+
+// shields: a ring of pips around the cup, lit = remaining
+function drawShields(p, r) {
+  const n = CFG.shields;
+  if (!n) return;
+  const rr = r + 7, gap = 0.18, seg = (Math.PI * 2) / n;
+  ctx.lineWidth = 5; ctx.lineCap = 'round';
+  for (let i = 0; i < n; i++) {
+    const a0 = -Math.PI / 2 + i * seg + gap / 2, a1 = a0 + seg - gap;
+    ctx.strokeStyle = i < p.shields ? C.cyan : 'rgba(244,240,255,.12)';
+    ctx.beginPath(); ctx.arc(p.x, p.y, rr, a0, a1); ctx.stroke();
+  }
+  ctx.lineCap = 'butt';
+}
+
+function drawPlayer(p, n) {
+  const r = p.r * (p.pop < 1 ? 0.4 + 0.6 * Math.sin(p.pop * Math.PI / 2) * 1.08 : 1);
+  const cooling = p.inv > 0 && phase === 'live';
+  ctx.globalAlpha = cooling && Math.floor(p.inv * 14) % 2 ? 0.55 : 1;
+  ctx.drawImage(p.sprite, p.x - r, p.y - r, r * 2, r * 2);
+  ctx.lineWidth = 3; ctx.strokeStyle = p.shields === 0 && phase === 'live' ? C.orange : PLATFORM_RIM[p.platform] || C.orange;
+  ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.stroke();
+  drawShields(p, r);
+  if (p.flash > 0) {
+    ctx.fillStyle = `rgba(255,255,255,${p.flash * 0.6})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  const nm = p.name.length > 13 ? p.name.slice(0, 12) + '…' : p.name;
+  label(nm, p.x, p.y + r + 22, `${n > 30 ? 12 : 15}px "Share Tech Mono", monospace`, p.shields === 0 && phase === 'live' ? C.orange : C.white);
+}
+
+function mmss(s) { s = Math.max(0, Math.ceil(s)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
+
+function drawHUD() {
+  if (titleLayer) ctx.drawImage(titleLayer, CX - 550, 18);
+  const sub = '28px "Share Tech Mono", monospace';
+  if (phase === 'open') {
+    label(`TYPE  !join  TO ENTER THE CUP   ·   ${mmss(lobbyEnd - T)}   ·   ${players.size} JOINED`, CX, 128, sub, C.cyan);
+    if (needMsg) label(needMsg, CX, CY, '900 34px Orbitron, sans-serif', C.orange);
+  } else if (phase === 'live' || phase === 'starting') {
+    label(`${alive.length} / ${total} STANDING   ·   SPEED ×${speedMult.toFixed(1)}`, CX, 128, sub, C.cyan);
+  } else if (phase === 'idle') {
+    label('NEXT ROUND SOON', CX, 128, sub, C.cyan);
+  }
+
+  if (phase !== 'winner') {
+    const rule = `EVERY CUP STARTS WITH ${CFG.shields} 🛡   ·   EACH BUMP COSTS ONE   ·   NO SHIELDS? NEXT BUMP SPILLS YOU`;
+    ctx.font = '19px "Share Tech Mono", monospace';
+    const rw = ctx.measureText(rule).width + 48;
+    panel(CX - rw / 2, H - 46, rw, 38, C.purple);
+    label(rule, CX, H - 27, '19px "Share Tech Mono", monospace', C.white);
+  }
+
+  if (fame.length) {
+    panel(40, 190, 300, 54 + fame.length * 34, C.orange);
+    label('🏆 HALL OF FAME', 60, 218, '700 18px Orbitron, sans-serif', C.orange, 'left');
+    fame.forEach((w, i) => {
+      const nm = w.name.length > 14 ? w.name.slice(0, 13) + '…' : w.name;
+      label(`${i + 1}. ${nm}`, 60, 254 + i * 34, '20px "Share Tech Mono", monospace', C.white, 'left');
+      label(`${w.wins}`, 320, 254 + i * 34, '20px "Share Tech Mono", monospace', C.cyan, 'right');
+    });
+  }
+
+  if ((phase === 'live' || phase === 'winner') && feed.length) {
+    feed.forEach((f, i) => {
+      const age = T - f.t;
+      ctx.globalAlpha = clamp(1 - (age - 8) / 2, 0, 1) * (1 - i * 0.08);
+      if (ctx.globalAlpha > 0) {
+        panel(W - 420, 190 + i * 50, 380, 40, C.orange);
+        const nm = f.name.length > 12 ? f.name.slice(0, 11) + '…' : f.name;
+        const by = f.by ? ` by ${f.by.length > 10 ? f.by.slice(0, 9) + '…' : f.by}` : '';
+        label(`☕ ${nm} spilled${by}`, W - 405, 210 + i * 50, '18px "Share Tech Mono", monospace', C.white, 'left');
+        label(`#${f.place}`, W - 55, 210 + i * 50, '700 18px Orbitron, sans-serif', C.orange, 'right');
+      }
+    });
+    ctx.globalAlpha = 1;
+  }
+
+  if (phase === 'live' && liveT < 3.6) {
+    const n = 3 - Math.floor(liveT);
+    const txt = n > 0 ? String(n) : 'BUMP!';
+    const k = liveT % 1;
+    ctx.globalAlpha = 1 - k * 0.6;
+    label(txt, CX, CY, `900 ${Math.round(150 - k * 40)}px Orbitron, sans-serif`, n > 0 ? C.cyan : C.orange);
+    ctx.globalAlpha = 1;
+  }
+
+  if (CFG.demo) label('DEMO MODE', W - 40, 40, '16px "Share Tech Mono", monospace', 'rgba(244,240,255,.6)', 'right');
+  else if (!netOk) label('● API OFFLINE', W - 40, 40, '16px "Share Tech Mono", monospace', C.pink, 'right');
+}
+
+function drawWinner() {
+  const w = winner, k = clamp(winT / 0.8, 0, 1), e = 1 - Math.pow(1 - k, 3);
+  ctx.fillStyle = `rgba(7,1,15,${0.6 * e})`;
+  ctx.beginPath(); ctx.arc(CX, CY, AR + 2, 0, Math.PI * 2); ctx.fill();
+  const r = 110 * e, y = CY - 40;
+  if (r > 1) {
+    for (let i = 0; i < 3; i++) {
+      ctx.strokeStyle = [C.orange, C.pink, C.cyan][i]; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.arc(CX, y, r + 12 + i * 10 + Math.sin(winT * 4 + i) * 3, 0, Math.PI * 2); ctx.stroke();
+    }
+    ctx.drawImage(w.sprite, CX - r, y - r, r * 2, r * 2);
+    ctx.font = `${Math.round(84 * e)}px serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('👑', CX, y - r - 46);
+  }
+  ctx.globalAlpha = e;
+  label(w.name, CX, y + 175, '900 54px Orbitron, sans-serif', C.orange);
+  label('IS THE LAST CUP STANDING', CX, y + 228, '30px "Share Tech Mono", monospace', C.cyan);
+  const wins = w.wins != null ? `   ·   ${w.wins} TOTAL WIN${w.wins === 1 ? '' : 'S'}` : '';
+  label(`${w.bumps} SPILL${w.bumps === 1 ? '' : 'S'}   ·   ${w.shields} 🛡 LEFT${wins}`, CX, y + 268, '22px "Share Tech Mono", monospace', C.white);
+  ctx.globalAlpha = 1;
+  label(CFG.auto ? `NEXT LOBBY IN ${mmss(cooldownEnd - T)}` : 'PRESS O FOR NEXT LOBBY', CX, 128, '28px "Share Tech Mono", monospace', C.cyan);
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  if (artLayer) ctx.drawImage(artLayer, 0, 0);
+  if (arenaLayer) ctx.drawImage(arenaLayer, 0, 0);
+  if (phase !== 'winner') {
+    const list = phase === 'live' || phase === 'starting' ? alive : [...players.values()];
+    const n = list.length;
+    for (const p of list) drawPlayer(p, n);
+  }
+  for (const q of parts) {
+    ctx.globalAlpha = clamp(1 - q.t / q.life, 0, 1);
+    ctx.fillStyle = q.color; ctx.fillRect(q.x - q.size / 2, q.y - q.size / 2, q.size, q.size);
+  }
+  ctx.globalAlpha = 1;
+  for (const f of floats) {
+    ctx.globalAlpha = clamp(1 - f.t / f.life, 0, 1);
+    label(f.text, f.x, f.y, '700 20px Orbitron, sans-serif', f.color);
+  }
+  ctx.globalAlpha = 1;
+  if (phase === 'winner' && winner) drawWinner();
+  drawHUD();
+}
+
+// ---------- loop ----------
+let last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  const fps = phase === 'idle' ? 15 : 40;
+  if (now - last < 1000 / fps - 1) return;
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  T += dt;
+  update(dt);
+  draw();
+}
+
+// ---------- hotkeys ----------
+addEventListener('keydown', (e) => {
+  const k = e.key.toLowerCase();
+  if (k === 'o') openLobby();
+  else if (k === 's') { if (phase === 'open') startRound(); }
+  else if (k === 'r') resetAll();
+  else if (k === 'b') { if (phase === 'open') for (let i = 0; i < 5; i++) addBot(); }
+  else if (k === 'k') { if (phase === 'live' && alive.length > 1) { const p = pick(alive); p.shields = 0; bump(p, null, true); processEliminations(); } }
+  else if (k === 'm') CFG.sound = !CFG.sound;
+});
+
+// ---------- boot ----------
+(async function boot() {
+  try { await Promise.race([document.fonts.ready, new Promise((r) => setTimeout(r, 2500))]); } catch (e) {}
+  buildLayers();
+  loadArt();
+  try { document.fonts.addEventListener('loadingdone', () => { buildLayers(); players.forEach((p) => makeSprite(p)); }); } catch (e) {}
+  phase = 'idle';
+  poll();
+  if (CFG.auto) openLobby();
+  requestAnimationFrame(frame);
+  window.LCS = { get phase() { return phase; }, get alive() { return alive.length; }, get players() { return players; }, get liveT() { return liveT; }, startRound, addBot };
+})();
+</script>
+</body>
+</html>
