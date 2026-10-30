@@ -27,6 +27,7 @@
      hitcd=0.8       (seconds of shield cooldown after taking a bump)
      auto=0          (disable auto-cycling lobby → round → winner)
      lobby=0         (0 = host starts the round with !cupstart or S — default; >0 = auto-start after N seconds)
+     cmd=battle      (join command shown on screen; otherwise JOIN_CMD from the server, default battle)
      cooldown=12  min=2   bg=1 (opaque)  sound=0  demo=1
      art=URL         (background image; default: tries bg.jpg / bg.png / bg.webp next to this page)
      artop=0.5       (background opacity 0–1)   artblur=0 (blur px)   art=none (turn it off)
@@ -47,6 +48,8 @@ const CFG = {
   cooldown: +(Q.get('cooldown') || 12),
   min: Math.max(2, +(Q.get('min') || 2)),
   sound: Q.get('sound') !== '0',
+  joinCmd: (Q.get('cmd') || 'battle').replace(/^!/, ''),
+  joinFromUrl: Q.has('cmd'),
   art: Q.get('art') || '',
   artop: clamp01(Q.get('artop'), 0.5),
   artblur: Math.max(0, +(Q.get('artblur') || 0)),
@@ -132,6 +135,7 @@ async function poll() {
     netOk = true;
     fame = s.top || [];
     if (!CFG.shieldsFromUrl && Number.isFinite(s.shields)) CFG.shields = s.shields;
+    if (!CFG.joinFromUrl && s.joinCmd) CFG.joinCmd = s.joinCmd;
     if (phase === 'open' && s.state && s.state.round === round) {
       for (const pl of s.roster || []) if (!players.has(pl.login)) addPlayer(pl, true);
     }
@@ -548,7 +552,7 @@ function drawHUD() {
   const sub = '28px "Share Tech Mono", monospace';
   if (phase === 'open') {
     const timer = CFG.lobby > 0 ? `${mmss(lobbyEnd - T)}   ·   ` : '';
-    label(`TYPE  !join  TO ENTER THE CUP   ·   ${timer}${players.size} JOINED`, CX, 128, sub, C.cyan);
+    label(`TYPE  !${CFG.joinCmd}  TO ENTER THE CUP   ·   ${timer}${players.size} JOINED`, CX, 128, sub, C.cyan);
     if (CFG.lobby === 0 && !needMsg) {
       const msg = players.size < CFG.min ? `WAITING FOR ${CFG.min - players.size} MORE` : 'WAITING FOR THE HOST TO START';
       ctx.globalAlpha = 0.65 + 0.35 * Math.sin(T * 3);

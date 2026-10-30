@@ -26,6 +26,7 @@ module.exports = async function handler(req, res) {
       roster,
       req: isOverlay ? reqCmd || null : null,
       shields: parseInt(process.env.START_SHIELDS || '5', 10),
+      joinCmd: String(process.env.JOIN_CMD || 'battle').replace(/^!/, ''),
       top: logins.map((l, i) => ({ login: l, name: names?.[i] || l, wins: parseInt(top[i * 2 + 1], 10) })),
     });
   } catch (e) {
