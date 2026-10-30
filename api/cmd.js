@@ -27,6 +27,14 @@ module.exports = async function handler(req, res) {
       return send(`🏆 Last Cup Standing champs: ${list}`);
     }
 
+    if (action === 'whoami') {
+      const avatar = id.login ? await resolveAvatar(id) : '';
+      return send(
+        `🔎 login=${id.login || '?'} platform=${id.platform || '?'} id=${id.providerId ? id.providerId.slice(0, 8) + '…' : 'none'} ` +
+          `ytkey=${process.env.YOUTUBE_API_KEY ? 'set' : 'missing'} avatar=${avatar ? 'found' : 'none'}`
+      );
+    }
+
     if (!id.login) return send("☕ Couldn't read your username — try again!");
 
     if (action === 'join') {
