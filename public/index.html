@@ -26,7 +26,8 @@
      shields=5       (starting shields; otherwise uses START_SHIELDS from the server, default 5)
      hitcd=0.8       (seconds of shield cooldown after taking a bump)
      auto=0          (disable auto-cycling lobby → round → winner)
-     lobby=60  cooldown=12  min=2   bg=1 (opaque)  sound=0  demo=1
+     lobby=0         (0 = host starts the round with !cupstart or S — default; >0 = auto-start after N seconds)
+     cooldown=12  min=2   bg=1 (opaque)  sound=0  demo=1
      art=URL         (background image; default: tries bg.jpg / bg.png / bg.webp next to this page)
      artop=0.5       (background opacity 0–1)   artblur=0 (blur px)   art=none (turn it off)
      floor=0.7       (cup floor opacity; 0.7 with art, 0.88 without — lower shows more art)
@@ -42,7 +43,7 @@ const CFG = {
   shieldsFromUrl: !!Q.get('shields'),
   hitcd: +(Q.get('hitcd') || 1.0),
   auto: Q.get('auto') !== '0',
-  lobby: +(Q.get('lobby') || 60),
+  lobby: Math.max(0, +(Q.get('lobby') || 0)),
   cooldown: +(Q.get('cooldown') || 12),
   min: Math.max(2, +(Q.get('min') || 2)),
   sound: Q.get('sound') !== '0',
@@ -54,6 +55,7 @@ const CFG = {
 };
 function clamp01(v, d) { const n = v === null || v === '' ? d : +v; return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : d; }
 CFG.demo = Q.get('demo') === '1' || !CFG.key || !CFG.api;
+if (CFG.demo && !Q.has('lobby')) CFG.lobby = 30;   // demo preview runs itself
 if (Q.get('bg') === '1') document.body.classList.add('bg');
 
 const C = { orange: '#ff8c1a', cyan: '#00e5ff', pink: '#ff2bd6', purple: '#7b2cff', deep: '#0d0221', white: '#f4f0ff' };
@@ -133,6 +135,9 @@ async function poll() {
     if (phase === 'open' && s.state && s.state.round === round) {
       for (const pl of s.roster || []) if (!players.has(pl.login)) addPlayer(pl, true);
     }
+    // host commands from chat (!cupstart / !cupnext)
+    if (s.req === 'start' && phase === 'open') startRound();
+    else if (s.req === 'open') openLobby();
   } catch (e) { netOk = false; }
   setTimeout(poll, 1500);
 }
@@ -392,11 +397,13 @@ function update(dt) {
       demoJoinTimer -= dt;
       if (demoJoinTimer <= 0 && players.size < 22) { addBot(); demoJoinTimer = rnd(0.5, 1.8); }
     }
-    const left = lobbyEnd - T;
-    if (left <= 3 && left > 0 && Math.ceil(left) !== Math.ceil(left + dt)) sfx.tick();
-    if (left <= 0) {
-      if (players.size >= CFG.min) { needMsg = ''; startRound(); }
-      else { needMsg = `NEED ${CFG.min - players.size} MORE TO START`; lobbyEnd = T + 20; }
+    if (CFG.lobby > 0) {                     // timed mode only — manual mode waits for the host
+      const left = lobbyEnd - T;
+      if (left <= 3 && left > 0 && Math.ceil(left) !== Math.ceil(left + dt)) sfx.tick();
+      if (left <= 0) {
+        if (players.size >= CFG.min) { needMsg = ''; startRound(); }
+        else { needMsg = `NEED ${CFG.min - players.size} MORE TO START`; lobbyEnd = T + 20; }
+      }
     }
   }
 
@@ -478,8 +485,6 @@ function buildLayers() {
   g.beginPath(); g.arc(CX, CY, AR, 0, Math.PI * 2); g.stroke();
   g.shadowColor = C.cyan; g.strokeStyle = C.cyan; g.lineWidth = 2;
   g.beginPath(); g.arc(CX, CY, AR + 10, 0, Math.PI * 2); g.stroke();
-  g.shadowColor = C.orange; g.strokeStyle = C.orange; g.lineWidth = 6;
-  g.beginPath(); g.arc(CX + AR + 40, CY, 70, -Math.PI / 2.4, Math.PI / 2.4); g.stroke();
 
   titleLayer = document.createElement('canvas');
   titleLayer.width = 1100; titleLayer.height = 110;
@@ -542,7 +547,14 @@ function drawHUD() {
   if (titleLayer) ctx.drawImage(titleLayer, CX - 550, 18);
   const sub = '28px "Share Tech Mono", monospace';
   if (phase === 'open') {
-    label(`TYPE  !join  TO ENTER THE CUP   ·   ${mmss(lobbyEnd - T)}   ·   ${players.size} JOINED`, CX, 128, sub, C.cyan);
+    const timer = CFG.lobby > 0 ? `${mmss(lobbyEnd - T)}   ·   ` : '';
+    label(`TYPE  !join  TO ENTER THE CUP   ·   ${timer}${players.size} JOINED`, CX, 128, sub, C.cyan);
+    if (CFG.lobby === 0 && !needMsg) {
+      const msg = players.size < CFG.min ? `WAITING FOR ${CFG.min - players.size} MORE` : 'WAITING FOR THE HOST TO START';
+      ctx.globalAlpha = 0.65 + 0.35 * Math.sin(T * 3);
+      label(msg, CX, CY, '900 30px Orbitron, sans-serif', C.orange);
+      ctx.globalAlpha = 1;
+    }
     if (needMsg) label(needMsg, CX, CY, '900 34px Orbitron, sans-serif', C.orange);
   } else if (phase === 'live' || phase === 'starting') {
     label(`${alive.length} / ${total} STANDING   ·   SPEED ×${speedMult.toFixed(1)}`, CX, 128, sub, C.cyan);

@@ -27,7 +27,32 @@ module.exports = async function handler(req, res) {
       return send(`🏆 Last Cup Standing champs: ${list}`);
     }
 
+    // Host-only commands. The Fossabot response URL carries &key=ADMIN_KEY (never shown in chat);
+    // also set these commands to Moderator/Broadcaster permission in Fossabot.
+    if (['start', 'next', 'wipe'].includes(action)) {
+      if (!process.env.ADMIN_KEY || req.query.key !== process.env.ADMIN_KEY) return send('🔒 Host only.');
+      if (action === 'start') {
+        const [stateRaw] = await pipe([['GET', 'lcs:state']]);
+        const state = parse(stateRaw, { phase: 'idle' });
+        if (state.phase === 'live') return send('⚔️ A round is already brewing!');
+        if (state.phase !== 'open') return send('☕ No lobby open — use !cupnext to open one.');
+        const [n] = await pipe([['HLEN', `lcs:roster:${state.round}`]]);
+        if (n < 2) return send(`☕ Need at least 2 cups to start — ${n} joined so far. Type !join!`);
+        await pipe([['SET', 'lcs:req', 'start', 'EX', 30]]);
+        return send(`🔔 ${n} cups in — 3… 2… 1… BUMP!`);
+      }
+      if (action === 'next') {
+        await pipe([['SET', 'lcs:req', 'open', 'EX', 30]]);
+        return send('☕ New lobby is open — type !join to enter the cup!');
+      }
+      if (action === 'wipe') {
+        await pipe([['DEL', 'lcs:wins', 'lcs:names', 'lcs:last']]);
+        return send('🧹 Last Cup Standing Hall of Fame has been wiped. Fresh season!');
+      }
+    }
+
     if (action === 'whoami') {
+      // Debug: shows what Fossabot sent and whether an avatar resolves. Safe to leave in.
       const avatar = id.login ? await resolveAvatar(id) : '';
       return send(
         `🔎 login=${id.login || '?'} platform=${id.platform || '?'} id=${id.providerId ? id.providerId.slice(0, 8) + '…' : 'none'} ` +

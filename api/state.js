@@ -1,13 +1,16 @@
-// Overlay polls this: current phase, roster of joined players, top winners.
+// Overlay polls this: current phase, roster of joined players, top winners, pending host command.
 const { pipe, hashToObj, parse } = require('../lib/redis');
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cache-Control', 'no-store');
   try {
-    const [stateRaw, top] = await pipe([
+    // Only the overlay (which sends the admin key) consumes pending host commands.
+    const isOverlay = process.env.ADMIN_KEY && (req.query || {}).key === process.env.ADMIN_KEY;
+    const [stateRaw, top, reqCmd] = await pipe([
       ['GET', 'lcs:state'],
       ['ZREVRANGE', 'lcs:wins', 0, 4, 'WITHSCORES'],
+      isOverlay ? ['GETDEL', 'lcs:req'] : ['GET', 'lcs:noop'],
     ]);
     const state = parse(stateRaw, { phase: 'idle', round: 0 });
     const logins = (top || []).filter((_, i) => i % 2 === 0);
@@ -21,6 +24,7 @@ module.exports = async function handler(req, res) {
     res.status(200).json({
       state,
       roster,
+      req: isOverlay ? reqCmd || null : null,
       shields: parseInt(process.env.START_SHIELDS || '5', 10),
       top: logins.map((l, i) => ({ login: l, name: names?.[i] || l, wins: parseInt(top[i * 2 + 1], 10) })),
     });
