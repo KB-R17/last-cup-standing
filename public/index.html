@@ -32,6 +32,7 @@
      winvol=0.4      (winner track volume 0–1)   winloop=1 (loop the track until the next lobby)
      bgm=URL         (battle music, loops while a round is live; default battle.mp3 next to this page; bgm=none = off)
      bgmvol=0.35     (battle music volume 0–1)
+     debug=1         (show audio status on screen)
      hold=1          (winner screen + confetti stay up until !cupnext / O / R — default when lobby=0)
      cooldown=12  min=2   bg=1 (opaque)  sound=0  demo=1
      art=URL         (background image; default: tries bg.jpg / bg.png / bg.webp next to this page)
@@ -59,6 +60,7 @@ const CFG = {
   winloop: Q.get('winloop') === '1',
   bgm: Q.get('bgm') || '',                       // battle music URL (default: battle.mp3 next to this page)
   bgmvol: clamp01(Q.get('bgmvol'), 0.35),
+  debug: Q.get('debug') === '1',
   hold: Q.has('hold') ? Q.get('hold') !== '0' : null,   // keep the winner screen up until the host moves on
   joinFromUrl: Q.has('cmd'),
   art: Q.get('art') || '',
@@ -131,36 +133,112 @@ const sfx = {
   tick: () => tone(880, 0.05, 'square', 0.03),
 };
 
-// ---------- winner track ----------
-// Plays an audio file (win.mp3 by default). If it's missing or blocked, the synth fanfare plays instead.
-let winAudio = null, winAudioOk = false;
-function loadWinTrack() {
-  if (CFG.win === 'none') return;
-  winAudio = new Audio();
-  winAudio.preload = 'auto';
-  winAudio.loop = CFG.winloop;
-  winAudio.volume = CFG.winvol;
-  winAudio.addEventListener('canplaythrough', () => { winAudioOk = true; }, { once: true });
-  winAudio.addEventListener('error', () => { winAudioOk = false; });
-  winAudio.src = CFG.win || 'win.mp3';
-  winAudio.load();
+// ---------- music: gapless loops via Web Audio ----------
+// Each track is decoded into memory and looped sample-accurately (no gap/click at the loop point).
+// If Web Audio can't load it, it falls back to a plain <audio> element.
+function audioCtx() {
+  try { AC = AC || new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+  if (AC && AC.state === 'suspended') AC.resume().catch(() => {});
+  return AC;
 }
-function playWinTrack() {
-  if (!CFG.sound) return;
-  if (winAudio && winAudioOk) {
-    try {
-      winAudio.currentTime = 0;
-      const pr = winAudio.play();
-      if (pr && pr.catch) pr.catch(() => fanfare());
-      return;
-    } catch (e) {}
+class LoopTrack {
+  constructor(name, url, vol, loop) {
+    this.name = name; this.url = url; this.vol = vol; this.loop = loop;
+    this.buf = null; this.src = null; this.gain = null; this.el = null;
+    this.status = url ? 'loading' : 'off';
+    if (url) this.load();
   }
-  fanfare();
+  bust() { return this.url + (this.url.includes('?') ? '&' : '?') + 'v=' + Date.now(); }
+  async load() {
+    this.status = 'loading';
+    try {
+      const ctx = audioCtx();
+      if (!ctx) throw new Error('no WebAudio');
+      const r = await fetch(this.bust(), { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.arrayBuffer();
+      this.buf = await new Promise((res, rej) => {
+        const p = ctx.decodeAudioData(data, res, rej);
+        if (p && p.then) p.then(res, rej);
+      });
+      this.status = 'ready';
+    } catch (e) {
+      // fallback: <audio> element
+      this.buf = null;
+      this.el = new Audio(this.bust());
+      this.el.preload = 'auto'; this.el.loop = this.loop; this.el.volume = this.vol;
+      this.el.addEventListener('canplaythrough', () => { if (this.status !== 'playing') this.status = 'ready (fallback)'; });
+      this.el.addEventListener('error', () => { this.status = `FILE NOT FOUND / UNREADABLE — ${this.url} missing?`; });
+      this.status = String(e.message).startsWith('HTTP 404') ? `FILE NOT FOUND — ${this.url} missing?` : 'loading (fallback)';
+    }
+  }
+  ok() { return !!this.buf || (this.el && !this.el.error && this.el.readyState >= 2); }
+  play() {
+    if (!CFG.sound || !this.url) return false;
+    this.stop(0);
+    if (!this.ok()) { if (/NOT FOUND|loading/.test(this.status) && !this.buf) this.load(); return false; }
+    if (this.buf) {
+      const ctx = audioCtx();
+      this.gain = ctx.createGain();
+      this.gain.gain.value = this.vol;
+      this.src = ctx.createBufferSource();
+      this.src.buffer = this.buf;
+      this.src.loop = this.loop;
+      this.src.connect(this.gain).connect(ctx.destination);
+      this.src.onended = () => { if (this.status === 'playing') this.status = 'ready'; };
+      this.src.start();
+      this.status = 'playing';
+      return true;
+    }
+    try {
+      this.el.volume = this.vol; this.el.currentTime = 0;
+      const pr = this.el.play();
+      if (pr && pr.catch) pr.catch((e) => { this.status = 'PLAY BLOCKED: ' + (e && e.name || e); });
+      this.status = 'playing';
+      return true;
+    } catch (e) { this.status = 'PLAY ERROR: ' + e.message; return false; }
+  }
+  stop(fadeMs = 0) {
+    if (this.src) {
+      const src = this.src, g = this.gain, ctx = AC;
+      this.src = null; this.gain = null;
+      try {
+        if (fadeMs && ctx) {
+          g.gain.setValueAtTime(g.gain.value, ctx.currentTime);
+          g.gain.linearRampToValueAtTime(0, ctx.currentTime + fadeMs / 1000);
+          src.stop(ctx.currentTime + fadeMs / 1000 + 0.02);
+        } else src.stop();
+      } catch (e) {}
+    }
+    if (this.el && !this.el.paused) {
+      const el = this.el;
+      if (!fadeMs) { el.pause(); el.currentTime = 0; }
+      else {
+        const start = el.volume; let i = 0;
+        const iv = setInterval(() => {
+          i++; el.volume = Math.max(0, start * (1 - i / 20));
+          if (i >= 20) { clearInterval(iv); el.pause(); el.currentTime = 0; el.volume = this.vol; }
+        }, fadeMs / 20);
+      }
+    }
+    if (this.status === 'playing') this.status = this.buf ? 'ready' : 'ready (fallback)';
+  }
+  setMuted(m) {
+    if (this.gain) this.gain.gain.value = m ? 0 : this.vol;
+    if (this.el) this.el.muted = m;
+  }
 }
-function stopWinTrack() {
-  if (!winAudio) return;
-  try { winAudio.pause(); winAudio.currentTime = 0; } catch (e) {}
+
+let bgmTrack = null, winTrack = null;
+function loadMusic() {
+  bgmTrack = new LoopTrack('battle', CFG.bgm === 'none' ? '' : CFG.bgm || 'battle.mp3', CFG.bgmvol, true);
+  winTrack = new LoopTrack('win', CFG.win === 'none' ? '' : CFG.win || 'win.mp3', CFG.winvol, CFG.winloop);
 }
+function playBattleMusic() { if (bgmTrack) bgmTrack.play(); }
+function stopBattleMusic(fadeMs = 0) { if (bgmTrack) bgmTrack.stop(fadeMs); }
+function playWinTrack() { if (!CFG.sound) return; if (!winTrack || !winTrack.play()) fanfare(); }
+function stopWinTrack() { if (winTrack) winTrack.stop(0); }
+
 // synth fallback: short brass-style victory fanfare
 function fanfare() {
   const n = [[523, 0, .14], [523, .15, .14], [523, .3, .14], [523, .45, .42], [415, .9, .42], [466, 1.35, .42],
@@ -170,42 +248,6 @@ function fanfare() {
     tone(f * 1.5, len, 'triangle', 0.025, 0, d);
     tone(f / 2, len, 'sawtooth', 0.02, 0, d);
   }
-}
-
-// ---------- battle music ----------
-// Loops while a round is live. Fades out when someone wins, stops when a new lobby opens.
-let bgmAudio = null, bgmOk = false, bgmFade = null;
-function loadBattleMusic() {
-  if (CFG.bgm === 'none') return;
-  bgmAudio = new Audio();
-  bgmAudio.preload = 'auto';
-  bgmAudio.loop = true;
-  bgmAudio.volume = CFG.bgmvol;
-  bgmAudio.addEventListener('canplaythrough', () => { bgmOk = true; }, { once: true });
-  bgmAudio.addEventListener('error', () => { bgmOk = false; });
-  bgmAudio.src = CFG.bgm || 'battle.mp3';
-  bgmAudio.load();
-}
-function playBattleMusic() {
-  if (!CFG.sound || !bgmAudio || !bgmOk) return;
-  clearInterval(bgmFade);
-  try {
-    bgmAudio.volume = CFG.bgmvol;
-    bgmAudio.currentTime = 0;
-    const pr = bgmAudio.play();
-    if (pr && pr.catch) pr.catch(() => {});
-  } catch (e) {}
-}
-function stopBattleMusic(fadeMs = 0) {
-  if (!bgmAudio) return;
-  clearInterval(bgmFade);
-  if (!fadeMs || bgmAudio.paused) { try { bgmAudio.pause(); bgmAudio.currentTime = 0; } catch (e) {} return; }
-  const start = bgmAudio.volume, steps = 20; let i = 0;
-  bgmFade = setInterval(() => {
-    i++;
-    try { bgmAudio.volume = Math.max(0, start * (1 - i / steps)); } catch (e) {}
-    if (i >= steps) { clearInterval(bgmFade); try { bgmAudio.pause(); bgmAudio.currentTime = 0; bgmAudio.volume = CFG.bgmvol; } catch (e) {} }
-  }, fadeMs / steps);
 }
 
 // ---------- network ----------
@@ -775,6 +817,10 @@ function drawHUD() {
     ctx.globalAlpha = 1;
   }
 
+  if (CFG.debug) {
+    label(`AUDIO  battle: ${bgmTrack ? bgmTrack.status : '-'}  vol ${CFG.bgmvol}   ·   win: ${winTrack ? winTrack.status : '-'}  vol ${CFG.winvol}   ·   sound ${CFG.sound ? 'on' : 'MUTED (press M)'}`,
+      40, H - 80, '18px "Share Tech Mono", monospace', C.pink, 'left');
+  }
   if (CFG.demo) label('DEMO MODE', W - 40, 40, '16px "Share Tech Mono", monospace', 'rgba(244,240,255,.6)', 'right');
   else if (!netOk) label('● API OFFLINE', W - 40, 40, '16px "Share Tech Mono", monospace', C.pink, 'right');
 }
@@ -850,7 +896,7 @@ addEventListener('keydown', (e) => {
   else if (k === 'k') { if (phase === 'live' && alive.length > 1) { const p = pick(alive); p.shields = 0; bump(p, null, true); processEliminations(); } }
   else if (k === 'm') {
     CFG.sound = !CFG.sound;
-    for (const a of [bgmAudio, winAudio]) if (a) a.muted = !CFG.sound;
+    for (const t of [bgmTrack, winTrack]) if (t) t.setMuted(!CFG.sound);
   }
 });
 
@@ -859,8 +905,7 @@ addEventListener('keydown', (e) => {
   try { await Promise.race([document.fonts.ready, new Promise((r) => setTimeout(r, 2500))]); } catch (e) {}
   buildLayers();
   loadArt();
-  loadWinTrack();
-  loadBattleMusic();
+  loadMusic();
   try { document.fonts.addEventListener('loadingdone', () => { buildLayers(); players.forEach((p) => makeSprite(p)); }); } catch (e) {}
   phase = 'idle';
   poll();
