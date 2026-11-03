@@ -29,7 +29,9 @@
      lobby=0         (0 = host starts the round with !cupstart or S — default; >0 = auto-start after N seconds)
      cmd=battle      (join command shown on screen; otherwise JOIN_CMD from the server, default battle)
      win=URL         (winner track; default plays win.mp3 next to this page, synth fanfare if missing; win=none = synth only)
-     winvol=0.7      (winner track volume 0–1)   winloop=1 (loop the track until the next lobby)
+     winvol=0.4      (winner track volume 0–1)   winloop=1 (loop the track until the next lobby)
+     bgm=URL         (battle music, loops while a round is live; default battle.mp3 next to this page; bgm=none = off)
+     bgmvol=0.35     (battle music volume 0–1)
      hold=1          (winner screen + confetti stay up until !cupnext / O / R — default when lobby=0)
      cooldown=12  min=2   bg=1 (opaque)  sound=0  demo=1
      art=URL         (background image; default: tries bg.jpg / bg.png / bg.webp next to this page)
@@ -53,8 +55,10 @@ const CFG = {
   sound: Q.get('sound') !== '0',
   joinCmd: (Q.get('cmd') || 'battle').replace(/^!/, ''),
   win: Q.get('win') || '',                       // winner track URL (default: win.mp3 next to this page)
-  winvol: clamp01(Q.get('winvol'), 0.7),
+  winvol: clamp01(Q.get('winvol'), 0.4),
   winloop: Q.get('winloop') === '1',
+  bgm: Q.get('bgm') || '',                       // battle music URL (default: battle.mp3 next to this page)
+  bgmvol: clamp01(Q.get('bgmvol'), 0.35),
   hold: Q.has('hold') ? Q.get('hold') !== '0' : null,   // keep the winner screen up until the host moves on
   joinFromUrl: Q.has('cmd'),
   art: Q.get('art') || '',
@@ -168,6 +172,42 @@ function fanfare() {
   }
 }
 
+// ---------- battle music ----------
+// Loops while a round is live. Fades out when someone wins, stops when a new lobby opens.
+let bgmAudio = null, bgmOk = false, bgmFade = null;
+function loadBattleMusic() {
+  if (CFG.bgm === 'none') return;
+  bgmAudio = new Audio();
+  bgmAudio.preload = 'auto';
+  bgmAudio.loop = true;
+  bgmAudio.volume = CFG.bgmvol;
+  bgmAudio.addEventListener('canplaythrough', () => { bgmOk = true; }, { once: true });
+  bgmAudio.addEventListener('error', () => { bgmOk = false; });
+  bgmAudio.src = CFG.bgm || 'battle.mp3';
+  bgmAudio.load();
+}
+function playBattleMusic() {
+  if (!CFG.sound || !bgmAudio || !bgmOk) return;
+  clearInterval(bgmFade);
+  try {
+    bgmAudio.volume = CFG.bgmvol;
+    bgmAudio.currentTime = 0;
+    const pr = bgmAudio.play();
+    if (pr && pr.catch) pr.catch(() => {});
+  } catch (e) {}
+}
+function stopBattleMusic(fadeMs = 0) {
+  if (!bgmAudio) return;
+  clearInterval(bgmFade);
+  if (!fadeMs || bgmAudio.paused) { try { bgmAudio.pause(); bgmAudio.currentTime = 0; } catch (e) {} return; }
+  const start = bgmAudio.volume, steps = 20; let i = 0;
+  bgmFade = setInterval(() => {
+    i++;
+    try { bgmAudio.volume = Math.max(0, start * (1 - i / steps)); } catch (e) {}
+    if (i >= steps) { clearInterval(bgmFade); try { bgmAudio.pause(); bgmAudio.currentTime = 0; bgmAudio.volume = CFG.bgmvol; } catch (e) {} }
+  }, fadeMs / steps);
+}
+
 // ---------- network ----------
 async function api(path, params = {}) {
   const u = new URL(CFG.api + path);
@@ -263,7 +303,7 @@ function addBot() {
 // ---------- round flow ----------
 function clearArena() {
   players = new Map(); alive = []; feed = []; floats = []; winner = null; needMsg = ''; speedMult = 1;
-  confetti = []; stopWinTrack();
+  confetti = []; stopWinTrack(); stopBattleMusic();
 }
 
 async function openLobby() {
@@ -295,12 +335,14 @@ async function startRound() {
   liveT = 0; speedMult = 1;
   phase = 'live';
   sfx.bell();
+  playBattleMusic();
 }
 
 function endRound(w) {
   phase = 'winner';
   winner = w; winT = 0; w.wins = null; cannonT = 0.25; floats = [];
   cooldownEnd = T + CFG.cooldown;
+  stopBattleMusic(800);                                // fade the battle music under the win track
   playWinTrack();
   fireCannons(70);                                     // opening double blast
   if (!CFG.demo && !w.bot) {
@@ -806,7 +848,10 @@ addEventListener('keydown', (e) => {
   else if (k === 'r') resetAll();
   else if (k === 'b') { if (phase === 'open') for (let i = 0; i < 5; i++) addBot(); }
   else if (k === 'k') { if (phase === 'live' && alive.length > 1) { const p = pick(alive); p.shields = 0; bump(p, null, true); processEliminations(); } }
-  else if (k === 'm') CFG.sound = !CFG.sound;
+  else if (k === 'm') {
+    CFG.sound = !CFG.sound;
+    for (const a of [bgmAudio, winAudio]) if (a) a.muted = !CFG.sound;
+  }
 });
 
 // ---------- boot ----------
@@ -815,6 +860,7 @@ addEventListener('keydown', (e) => {
   buildLayers();
   loadArt();
   loadWinTrack();
+  loadBattleMusic();
   try { document.fonts.addEventListener('loadingdone', () => { buildLayers(); players.forEach((p) => makeSprite(p)); }); } catch (e) {}
   phase = 'idle';
   poll();
