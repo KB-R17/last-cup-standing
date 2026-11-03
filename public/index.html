@@ -28,6 +28,9 @@
      auto=0          (disable auto-cycling lobby → round → winner)
      lobby=0         (0 = host starts the round with !cupstart or S — default; >0 = auto-start after N seconds)
      cmd=battle      (join command shown on screen; otherwise JOIN_CMD from the server, default battle)
+     win=URL         (winner track; default plays win.mp3 next to this page, synth fanfare if missing; win=none = synth only)
+     winvol=0.7      (winner track volume 0–1)   winloop=1 (loop the track until the next lobby)
+     hold=1          (winner screen + confetti stay up until !cupnext / O / R — default when lobby=0)
      cooldown=12  min=2   bg=1 (opaque)  sound=0  demo=1
      art=URL         (background image; default: tries bg.jpg / bg.png / bg.webp next to this page)
      artop=0.5       (background opacity 0–1)   artblur=0 (blur px)   art=none (turn it off)
@@ -49,6 +52,10 @@ const CFG = {
   min: Math.max(2, +(Q.get('min') || 2)),
   sound: Q.get('sound') !== '0',
   joinCmd: (Q.get('cmd') || 'battle').replace(/^!/, ''),
+  win: Q.get('win') || '',                       // winner track URL (default: win.mp3 next to this page)
+  winvol: clamp01(Q.get('winvol'), 0.7),
+  winloop: Q.get('winloop') === '1',
+  hold: Q.has('hold') ? Q.get('hold') !== '0' : null,   // keep the winner screen up until the host moves on
   joinFromUrl: Q.has('cmd'),
   art: Q.get('art') || '',
   artop: clamp01(Q.get('artop'), 0.5),
@@ -59,6 +66,7 @@ const CFG = {
 function clamp01(v, d) { const n = v === null || v === '' ? d : +v; return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : d; }
 CFG.demo = Q.get('demo') === '1' || !CFG.key || !CFG.api;
 if (CFG.demo && !Q.has('lobby')) CFG.lobby = 30;   // demo preview runs itself
+if (CFG.hold === null) CFG.hold = CFG.lobby === 0;   // manual mode: winner celebration holds until you move on
 if (Q.get('bg') === '1') document.body.classList.add('bg');
 
 const C = { orange: '#ff8c1a', cyan: '#00e5ff', pink: '#ff2bd6', purple: '#7b2cff', deep: '#0d0221', white: '#f4f0ff' };
@@ -115,9 +123,50 @@ const sfx = {
   boop: () => tone(240, 0.06, 'sine', 0.025, -60),
   spill: () => tone(320, 0.35, 'sawtooth', 0.05, -260),
   bell: () => { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.18, 'square', 0.04, 0, i * 0.09)); },
-  win: () => { [523, 659, 784, 1047, 784, 1047, 1319].forEach((f, i) => tone(f, 0.22, 'square', 0.045, 0, i * 0.12)); },
+  pop: () => { tone(160, 0.12, 'sine', 0.05, -110); tone(2400, 0.05, 'square', 0.012, -1800); },
   tick: () => tone(880, 0.05, 'square', 0.03),
 };
+
+// ---------- winner track ----------
+// Plays an audio file (win.mp3 by default). If it's missing or blocked, the synth fanfare plays instead.
+let winAudio = null, winAudioOk = false;
+function loadWinTrack() {
+  if (CFG.win === 'none') return;
+  winAudio = new Audio();
+  winAudio.preload = 'auto';
+  winAudio.loop = CFG.winloop;
+  winAudio.volume = CFG.winvol;
+  winAudio.addEventListener('canplaythrough', () => { winAudioOk = true; }, { once: true });
+  winAudio.addEventListener('error', () => { winAudioOk = false; });
+  winAudio.src = CFG.win || 'win.mp3';
+  winAudio.load();
+}
+function playWinTrack() {
+  if (!CFG.sound) return;
+  if (winAudio && winAudioOk) {
+    try {
+      winAudio.currentTime = 0;
+      const pr = winAudio.play();
+      if (pr && pr.catch) pr.catch(() => fanfare());
+      return;
+    } catch (e) {}
+  }
+  fanfare();
+}
+function stopWinTrack() {
+  if (!winAudio) return;
+  try { winAudio.pause(); winAudio.currentTime = 0; } catch (e) {}
+}
+// synth fallback: short brass-style victory fanfare
+function fanfare() {
+  const n = [[523, 0, .14], [523, .15, .14], [523, .3, .14], [523, .45, .42], [415, .9, .42], [466, 1.35, .42],
+    [523, 1.8, .2], [466, 2.05, .14], [523, 2.25, .9]];
+  for (const [f, d, len] of n) {
+    tone(f, len, 'square', 0.035, 0, d);
+    tone(f * 1.5, len, 'triangle', 0.025, 0, d);
+    tone(f / 2, len, 'sawtooth', 0.02, 0, d);
+  }
+}
 
 // ---------- network ----------
 async function api(path, params = {}) {
@@ -214,6 +263,7 @@ function addBot() {
 // ---------- round flow ----------
 function clearArena() {
   players = new Map(); alive = []; feed = []; floats = []; winner = null; needMsg = ''; speedMult = 1;
+  confetti = []; stopWinTrack();
 }
 
 async function openLobby() {
@@ -249,9 +299,10 @@ async function startRound() {
 
 function endRound(w) {
   phase = 'winner';
-  winner = w; winT = 0; w.wins = null;
+  winner = w; winT = 0; w.wins = null; cannonT = 0.25; floats = [];
   cooldownEnd = T + CFG.cooldown;
-  sfx.win();
+  playWinTrack();
+  fireCannons(70);                                     // opening double blast
   if (!CFG.demo && !w.bot) {
     api('/api/round', { action: 'end', winner: w.login, name: w.name })
       .then((r) => { w.wins = r.wins; })
@@ -312,10 +363,79 @@ function burst(x, y, color, n, sp) {
     parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rnd(0.4, 0.9), t: 0, color, size: rnd(2, 5) });
   }
 }
-function confetti() {
-  for (let i = 0; i < 4 && parts.length < 700; i++) {
-    parts.push({ x: rnd(300, 1620), y: -10, vx: rnd(-40, 40), vy: rnd(160, 300), life: 4, t: 0, color: pick([C.orange, C.cyan, C.pink, C.purple]), size: rnd(4, 8), g: 1 });
+// Winner confetti cannons: one on each side of the winner's icon, firing on a loop.
+let confetti = [], cannonT = 0, flashes = [];
+const CONF_COLORS = [C.orange, C.cyan, C.pink, C.purple, '#ffe14d', C.white];
+const WIN_Y = CY - 40, CANNON_DX = 190, CANNON_DY = 70;
+function fireCannons(n) {
+  for (const side of [-1, 1]) {
+    const x = CX + side * CANNON_DX, y = WIN_Y + CANNON_DY;
+    flashes.push({ x, y, side, t: 0 });
+    for (let i = 0; i < n && confetti.length < 650; i++) {
+      // aim up and outward, fanned
+      const a = -Math.PI / 2 + side * rnd(0.15, 0.75), sp = rnd(520, 900);
+      confetti.push({
+        x: x + side * 14, y: y - 14, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+        t: 0, life: rnd(2.4, 3.4), color: pick(CONF_COLORS),
+        w: rnd(7, 13), h: rnd(3.5, 6), rot: rnd(0, 6.28), spin: rnd(-9, 9), flip: rnd(4, 11), round: rand() < 0.2,
+      });
+    }
   }
+  sfx.pop();
+}
+function updateConfetti(dt) {
+  for (const q of confetti) {
+    q.t += dt;
+    q.vy += 900 * dt;                      // gravity
+    q.vx *= Math.pow(0.35, dt);            // air drag
+    q.vy *= Math.pow(0.55, dt);
+    q.x += q.vx * dt + Math.sin(q.t * q.flip) * 18 * dt;   // flutter
+    q.y += q.vy * dt;
+    q.rot += q.spin * dt;
+  }
+  confetti = confetti.filter((q) => q.t < q.life && q.y < H + 40);
+  for (const f of flashes) f.t += dt;
+  flashes = flashes.filter((f) => f.t < 0.25);
+}
+function drawCannons() {
+  for (const side of [-1, 1]) {
+    const x = CX + side * CANNON_DX, y = WIN_Y + CANNON_DY;
+    const kick = flashes.some((f) => f.side === side) ? 6 : 0;
+    ctx.save();
+    ctx.translate(x - side * kick * 0.5, y + kick);
+    ctx.rotate(side * 0.45);
+    // party-popper cone
+    const g = ctx.createLinearGradient(0, 30, 0, -26);
+    g.addColorStop(0, C.purple); g.addColorStop(1, side < 0 ? C.orange : C.cyan);
+    ctx.fillStyle = g; ctx.strokeStyle = C.white; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(-5, 32); ctx.lineTo(5, 32); ctx.lineTo(20, -24); ctx.lineTo(-20, -24); ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    ctx.strokeStyle = 'rgba(244,240,255,.55)'; ctx.lineWidth = 3;
+    for (const yy of [14, -4]) { ctx.beginPath(); ctx.moveTo(-14 + (32 - yy) * 0.05, yy); ctx.lineTo(14 - (32 - yy) * 0.05, yy); ctx.stroke(); }
+    ctx.restore();
+  }
+  ctx.globalCompositeOperation = 'lighter';
+  for (const f of flashes) {
+    const k = f.t / 0.25, x = CX + f.side * CANNON_DX + f.side * 12, y = WIN_Y + CANNON_DY - 36, r = 10 + k * 26;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, `rgba(255,246,200,${0.9 * (1 - k)})`); g.addColorStop(1, 'rgba(255,140,26,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+function drawConfetti() {
+  for (const q of confetti) {
+    ctx.globalAlpha = clamp((q.life - q.t) / 0.6, 0, 1);
+    ctx.fillStyle = q.color;
+    ctx.save();
+    ctx.translate(q.x, q.y);
+    ctx.rotate(q.rot);
+    if (q.round) { ctx.beginPath(); ctx.arc(0, 0, q.h * 0.8, 0, Math.PI * 2); ctx.fill(); }
+    else { const sx = Math.cos(q.t * q.flip); ctx.scale(Math.abs(sx) < 0.15 ? 0.15 : sx, 1); ctx.fillRect(-q.w / 2, -q.h / 2, q.w, q.h); }
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
 }
 
 // ---------- physics ----------
@@ -421,10 +541,15 @@ function update(dt) {
 
   if (phase === 'winner') {
     winT += dt;
-    if (winT < 6) confetti();
-    if (T >= cooldownEnd) { if (CFG.auto) openLobby(); else { clearArena(); phase = 'idle'; } }
+    cannonT -= dt;
+    if (cannonT <= 0) {                         // keep firing until the host moves on
+      fireCannons(winT < 4 ? 34 : 28);
+      cannonT = winT < 4 ? rnd(0.45, 0.65) : rnd(0.7, 1.0);
+    }
+    if (!CFG.hold && T >= cooldownEnd) { if (CFG.auto) openLobby(); else { clearArena(); phase = 'idle'; } }
   }
 
+  updateConfetti(dt);
   for (const q of parts) { q.t += dt; q.x += q.vx * dt; q.y += q.vy * dt; if (q.g) q.vx *= 0.99; else { q.vx *= 0.94; q.vy *= 0.94; } }
   parts = parts.filter((q) => q.t < q.life);
   for (const f of floats) { f.t += dt; f.y -= 34 * dt; }
@@ -590,9 +715,9 @@ function drawHUD() {
       ctx.globalAlpha = clamp(1 - (age - 8) / 2, 0, 1) * (1 - i * 0.08);
       if (ctx.globalAlpha > 0) {
         panel(W - 420, 190 + i * 50, 380, 40, C.orange);
-        const nm = f.name.length > 12 ? f.name.slice(0, 11) + '…' : f.name;
-        const by = f.by ? ` by ${f.by.length > 10 ? f.by.slice(0, 9) + '…' : f.by}` : '';
-        label(`☕ ${nm} spilled${by}`, W - 405, 210 + i * 50, '18px "Share Tech Mono", monospace', C.white, 'left');
+        const nm = f.name.length > 11 ? f.name.slice(0, 10) + '…' : f.name;
+        const by = f.by ? ` by ${f.by.length > 9 ? f.by.slice(0, 8) + '…' : f.by}` : '';
+        label(`☕ ${nm} spilled${by}`, W - 405, 210 + i * 50, '16px "Share Tech Mono", monospace', C.white, 'left');
         label(`#${f.place}`, W - 55, 210 + i * 50, '700 18px Orbitron, sans-serif', C.orange, 'right');
       }
     });
@@ -632,7 +757,8 @@ function drawWinner() {
   const wins = w.wins != null ? `   ·   ${w.wins} TOTAL WIN${w.wins === 1 ? '' : 'S'}` : '';
   label(`${w.bumps} SPILL${w.bumps === 1 ? '' : 'S'}   ·   ${w.shields} 🛡 LEFT${wins}`, CX, y + 268, '22px "Share Tech Mono", monospace', C.white);
   ctx.globalAlpha = 1;
-  label(CFG.auto ? `NEXT LOBBY IN ${mmss(cooldownEnd - T)}` : 'PRESS O FOR NEXT LOBBY', CX, 128, '28px "Share Tech Mono", monospace', C.cyan);
+  const head = CFG.hold ? '🏆  WINNER WINNER, DONUT DINNER  🏆' : CFG.auto ? `NEXT LOBBY IN ${mmss(cooldownEnd - T)}` : 'PRESS O FOR NEXT LOBBY';
+  label(head, CX, 128, '28px "Share Tech Mono", monospace', CFG.hold ? C.orange : C.cyan);
 }
 
 function draw() {
@@ -654,7 +780,8 @@ function draw() {
     label(f.text, f.x, f.y, '700 20px Orbitron, sans-serif', f.color);
   }
   ctx.globalAlpha = 1;
-  if (phase === 'winner' && winner) drawWinner();
+  if (phase === 'winner' && winner) { drawWinner(); drawCannons(); }
+  drawConfetti();
   drawHUD();
 }
 
@@ -687,6 +814,7 @@ addEventListener('keydown', (e) => {
   try { await Promise.race([document.fonts.ready, new Promise((r) => setTimeout(r, 2500))]); } catch (e) {}
   buildLayers();
   loadArt();
+  loadWinTrack();
   try { document.fonts.addEventListener('loadingdone', () => { buildLayers(); players.forEach((p) => makeSprite(p)); }); } catch (e) {}
   phase = 'idle';
   poll();
